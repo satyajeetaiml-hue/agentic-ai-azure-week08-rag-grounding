@@ -1,45 +1,32 @@
-"""Week 8 — Memory, State & Grounding (RAG) — starter FastAPI service.
+"""Week 8 — Memory, State & Grounding (RAG).
 
-Use case: Clinical Policy Assistant (Healthcare).
-See README.md for the full lab brief. Run:  uvicorn app.main:app --reload
+Clinical Policy Assistant with permission-aware retrieval, citations, and an
+"I don't know" guardrail. Run:  uvicorn app.main:app --reload
 """
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
 
-app = FastAPI(title="Week 8 — Memory, State & Grounding (RAG)", version="0.1.0")
+from app.service import PolicyAnswer, PolicyQuestion, get_backend, get_settings
 
-
-class LabRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="The clinician's question about a care protocol.")
+settings = get_settings()
+app = FastAPI(title="Week 8 — RAG (Clinical Policy Assistant)", version="0.2.0")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "week": "8", "use_case": "Clinical Policy Assistant"}
+@app.get("/health", tags=["health"])
+def health() -> dict[str, str]:
+    return {"status": "ok", "week": "8", "backend": "search" if settings.use_search else "mock"}
 
 
-@app.get("/")
-def root():
+@app.get("/", tags=["root"])
+def root() -> dict[str, str]:
     return {
         "service": "agentic-ai-azure-week08-rag-grounding",
-        "week": "8",
         "endpoint": "/api/v1/policy/ask",
+        "backend": "search" if settings.use_search else "mock",
         "docs": "/docs",
     }
 
 
-@app.post("/api/v1/policy/ask")
-def handler(payload: LabRequest):
-    """Mock handler for the Clinical Policy Assistant.
-
-    TODO (lab): replace this stub with the real implementation described in
-    README.md (the Azure services for this week are listed in the Tech Stack).
-    """
-    return {
-        "week": "8",
-        "use_case": "Clinical Policy Assistant",
-        "received": payload.question,
-        "status": "accepted",
-        "note": "Mock response — implement the real agent per README.md.",
-    }
+@app.post("/api/v1/policy/ask", response_model=PolicyAnswer, tags=["week08"])
+def ask(payload: PolicyQuestion) -> PolicyAnswer:
+    return get_backend().ask(payload)
