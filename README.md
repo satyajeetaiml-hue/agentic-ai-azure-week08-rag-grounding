@@ -38,10 +38,56 @@ curl -X POST http://127.0.0.1:8000/api/v1/policy/ask \
 ```
 Run tests: `pytest -q`
 
-## ☁️ Search backend
-Set `AZURE_AI_SEARCH_ENDPOINT` + `AZURE_AI_SEARCH_KEY` (and optionally `FOUNDRY_PROJECT_ENDPOINT` to
-generate the answer). Your index needs `title`, `content`, and collection fields `roles`/`departments`
-for ACL filtering. `GET /health` reports `"backend": "search"`.
+## ☁️ Wire the real Azure backend (Azure AI Search)
+
+This lab ships a **real, runnable** Azure AI Search backend plus a one-time setup script that creates the
+index and ingests the sample clinical docs with embeddings.
+
+### 1. Provision (Azure CLI)
+```bash
+az login
+RG=rg-agentic-rag
+az group create -n $RG -l eastus
+
+# Azure AI Search service
+az search service create -g $RG -n my-clinical-search --sku basic
+az search admin-key show -g $RG --service-name my-clinical-search   # copy the primary key
+```
+You also need a **Microsoft Foundry** project with two deployments: a chat model (e.g. `gpt-4o`) and an
+**embedding** model (e.g. `text-embedding-3-small`, 1536 dims). Grant your identity the **Azure AI User**
+role on the Foundry project (`az login` provides the credential).
+
+### 2. Configure `.env`
+```bash
+cp .env.example .env
+```
+```
+AZURE_AI_SEARCH_ENDPOINT=https://my-clinical-search.search.windows.net
+AZURE_AI_SEARCH_KEY=<primary-admin-key>
+AZURE_AI_SEARCH_INDEX=clinical-policies
+FOUNDRY_PROJECT_ENDPOINT=https://<account>.services.ai.azure.com/api/projects/<project>
+FOUNDRY_MODEL_NAME=gpt-4o
+FOUNDRY_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
+```
+
+### 3. Create the index + ingest docs (one time)
+```bash
+python scripts/setup_search.py
+```
+This creates a vector-enabled index with **ACL collection fields** (`roles`, `departments`), an **HNSW**
+vector profile, and a **semantic** config, then embeds and uploads the docs.
+
+### 4. Run — now backed by Azure AI Search
+```bash
+uvicorn app.main:app --reload   # GET /health -> "backend": "search"
+```
+The query path (`app/service.py` → `SearchRagBackend`) embeds the question, runs a **hybrid** query
+(keyword + vector, RRF-fused), pushes **security trimming** into an OData `roles/any(...) and
+departments/any(...)` filter, and grounds the answer on the retrieved citations via Foundry. If no
+embedding deployment is set, it degrades to keyword-only search (still trimmed and grounded).
+
+> Without `FOUNDRY_EMBEDDING_DEPLOYMENT` you get keyword-only search; with it you get true hybrid.
 
 ## 🏗️ Architect's lens
 - Retrieval quality: chunking, hybrid search, reranking, recency.
@@ -54,8 +100,9 @@ FastAPI, azure-ai-projects v2.
 
 ## 📁 Structure
 ```
-app/service.py   # settings, schemas, retrieval + security trimming, backends
-app/main.py      # POST /api/v1/policy/ask
+app/service.py          # settings, schemas, mock + real (hybrid) Search backends
+app/main.py             # POST /api/v1/policy/ask
+scripts/setup_search.py # one-time: create index + ingest docs with embeddings
 tests/test_app.py
 ```
 

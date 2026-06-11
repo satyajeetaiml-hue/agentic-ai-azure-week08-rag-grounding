@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     app_env: str = "local"
     foundry_project_endpoint: str = ""
     foundry_model_name: str = "gpt-4o"
+    foundry_embedding_deployment: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
     azure_ai_search_endpoint: str = ""
     azure_ai_search_key: str = ""
     azure_ai_search_index: str = "clinical-policies"
@@ -36,6 +38,10 @@ class Settings(BaseSettings):
     @property
     def use_search(self) -> bool:
         return bool(self.azure_ai_search_endpoint and self.azure_ai_search_key)
+
+    @property
+    def use_embeddings(self) -> bool:
+        return bool(self.foundry_project_endpoint and self.foundry_embedding_deployment)
 
 
 @lru_cache
@@ -64,9 +70,11 @@ class PolicyAnswer(BaseModel):
     mode: str
 
 
-# ── mock knowledge base (with per-doc ACLs) ─────────────────────────────
-_DOCS = [
+# ── knowledge base (with per-doc ACLs) — shared by the mock backend and the
+#    setup_search.py ingestion script so both stay in sync. ────────────────
+CLINICAL_DOCS = [
     {
+        "id": "doc-1",
         "title": "Hip Replacement Post-Op Protocol",
         "content": "Post-operative antibiotic protocol for hip replacement: cefazolin 2g IV "
         "every 8 hours for 24 hours. Monitor for surgical-site infection.",
@@ -74,6 +82,7 @@ _DOCS = [
         "departments": ["orthopedics", "general"],
     },
     {
+        "id": "doc-2",
         "title": "Sepsis Care Pathway",
         "content": "Sepsis pathway: measure serum lactate, obtain blood cultures, and start "
         "broad-spectrum antibiotics within one hour of recognition.",
@@ -81,12 +90,14 @@ _DOCS = [
         "departments": ["general", "icu"],
     },
     {
+        "id": "doc-3",
         "title": "Controlled Substance Handling (Pharmacy)",
         "content": "Controlled substances require dual sign-off and reconciliation each shift.",
         "roles": ["pharmacist"],
         "departments": ["pharmacy"],
     },
 ]
+_DOCS = CLINICAL_DOCS  # backwards-compatible alias used by the mock retriever
 _WORD_RE = re.compile(r"[a-z]{3,}")
 
 
@@ -140,7 +151,15 @@ class MockRagBackend:
         )
 
 
+#: name of the vector field in the index (must match setup_search.py)
+VECTOR_FIELD = "contentVector"
+
+
 class SearchRagBackend:
+    """Real Azure AI Search backend: hybrid (keyword + vector) retrieval with
+    security-trimming pushed into the query, then grounded generation on Foundry.
+    """
+
     mode = "search"
 
     def ask(self, q: PolicyQuestion) -> PolicyAnswer:
@@ -153,43 +172,85 @@ class SearchRagBackend:
             index_name=s.azure_ai_search_index,
             credential=AzureKeyCredential(s.azure_ai_search_key),
         )
-        # Security trimming pushed into the query as an OData filter on ACL fields.
-        flt = f"roles/any(r: r eq '{q.user_role}') and departments/any(d: d eq '{q.department}')"
+        # Security trimming: an OData filter on the ACL collection fields. Documents
+        # the caller's role/department can't see never enter the result set.
+        flt = (
+            f"roles/any(r: r eq '{q.user_role}') and "
+            f"departments/any(d: d eq '{q.department}')"
+        )
+
+        # When Foundry embeddings are configured we run a *hybrid* query (keyword +
+        # vector, fused with RRF) and generate the answer in the same connection.
+        if s.use_embeddings:
+            return self._hybrid_ask(q, sc, flt, s)
+
+        # Keyword-only fallback (still security-trimmed and grounded).
         results = list(sc.search(search_text=q.question, filter=flt, top=3))
-        citations = [
-            Citation(title=r.get("title", "doc"), snippet=(r.get("content", "")[:160]),
-                     score=float(r.get("@search.score", 0.0)))
-            for r in results
-        ]
+        citations = _to_citations(results)
         if not citations:
-            return PolicyAnswer(
-                answer="I don't know based on the available, authorized documents.",
-                grounded=False, citations=[], trimmed_count=0, mode=self.mode,
-            )
-        answer = self._generate(q.question, citations) or f"{citations[0].snippet} (Source: {citations[0].title})"
+            return _idk(self.mode)
+        answer = f"{citations[0].snippet} (Source: {citations[0].title})"
         return PolicyAnswer(answer=answer, grounded=True, citations=citations, trimmed_count=0, mode=self.mode)
 
-    def _generate(self, question: str, citations: list[Citation]) -> str | None:
-        s = get_settings()
-        if not s.foundry_project_endpoint:
-            return None
+    def _hybrid_ask(self, q: PolicyQuestion, sc, flt: str, s) -> PolicyAnswer:
         from azure.ai.projects import AIProjectClient
         from azure.identity import DefaultAzureCredential
+        from azure.search.documents.models import VectorizedQuery
 
-        context = "\n".join(f"[{c.title}] {c.snippet}" for c in citations)
         with (
             DefaultAzureCredential() as cred,
             AIProjectClient(endpoint=s.foundry_project_endpoint, credential=cred) as proj,
         ):
-            client = proj.get_openai_client()
-            resp = client.responses.create(
+            oai = proj.get_openai_client()
+            query_vector = oai.embeddings.create(
+                model=s.foundry_embedding_deployment, input=q.question
+            ).data[0].embedding
+
+            vector_query = VectorizedQuery(
+                vector=query_vector, k_nearest_neighbors=5, fields=VECTOR_FIELD
+            )
+            results = list(
+                sc.search(
+                    search_text=q.question,          # keyword leg
+                    vector_queries=[vector_query],   # vector leg (RRF-fused)
+                    filter=flt,                      # security trimming
+                    select=["id", "title", "content", "roles", "departments"],
+                    top=3,
+                )
+            )
+            citations = _to_citations(results)
+            if not citations:
+                return _idk(self.mode)
+
+            context = "\n".join(f"[{c.title}] {c.snippet}" for c in citations)
+            resp = oai.responses.create(
                 model=s.foundry_model_name,
                 input=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {q.question}"},
                 ],
             )
-            return resp.output_text
+            answer = resp.output_text or f"{citations[0].snippet} (Source: {citations[0].title})"
+
+        return PolicyAnswer(answer=answer, grounded=True, citations=citations, trimmed_count=0, mode=self.mode)
+
+
+def _to_citations(results) -> list[Citation]:
+    return [
+        Citation(
+            title=r.get("title", "doc"),
+            snippet=(r.get("content", "") or "")[:160],
+            score=float(r.get("@search.score", 0.0)),
+        )
+        for r in results
+    ]
+
+
+def _idk(mode: str) -> PolicyAnswer:
+    return PolicyAnswer(
+        answer="I don't know based on the available, authorized documents.",
+        grounded=False, citations=[], trimmed_count=0, mode=mode,
+    )
 
 
 def get_backend():
