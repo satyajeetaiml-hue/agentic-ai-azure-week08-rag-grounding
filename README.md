@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/satyajeetaiml-hue/agentic-ai-azure-week08-rag-grounding/actions/workflows/ci.yml/badge.svg)](https://github.com/satyajeetaiml-hue/agentic-ai-azure-week08-rag-grounding/actions/workflows/ci.yml)
 
+> ▶️ **Run in VS Code — no Azure needed.** `pip install -r requirements.txt`, then `uvicorn app.main:app --reload` and open http://127.0.0.1:8000/docs. Runs in **mock mode** by default — no `az login`, keys, or `.env` required. Wiring real Azure (below) is optional.
+
 > **Standalone lab** from the *Agentic AI on Azure — Enterprise Master Class*.
 > Course hub: [azure-agentic-ai-masterclass](https://github.com/satyajeetaiml-hue/azure-agentic-ai-masterclass).
 
