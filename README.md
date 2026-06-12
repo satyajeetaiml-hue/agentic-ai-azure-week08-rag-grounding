@@ -115,3 +115,10 @@ Next: [Week 9 — Hosting & Scale](https://github.com/satyajeetaiml-hue/agentic-
 
 ## 📄 License
 MIT — see [`LICENSE`](LICENSE).
+
+## 📊 Teaching slides
+
+Download the **7-slide deck** for classroom use: [`agentic-ai-azure-week08-rag-grounding.pptx`](slides/agentic-ai-azure-week08-rag-grounding.pptx)
+
+> Slides: Title · Learning goal · Enterprise use case · Architecture/flow · Key concepts · Run it · Architect's takeaways.
+
